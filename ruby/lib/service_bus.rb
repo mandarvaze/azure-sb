@@ -8,51 +8,86 @@ require 'net/http'
 require 'json'
 require 'logger'
 
-def get_auth_token(sb_name, queue_name, sas_name, sas_value)
-  uri = URI.encode_www_form_component("https://#{sb_name}.servicebus.windows.net/#{queue_name}")
-  sas = sas_value.encode('utf-8')
-  expiry = (Time.now + 2_000).to_i.to_s
-  string_to_sign = "#{uri}\n#{expiry}".encode('utf-8')
-  signed_hmac_sha256 = OpenSSL::HMAC.digest(OpenSSL::Digest.new('sha256'), sas, string_to_sign)
-  signature = URI.encode_www_form_component(Base64.strict_encode64(signed_hmac_sha256))
+logger = Logger.new($stdout)
+logger.level = ENV.fetch('LOGLEVEL', 'DEBUG')
 
-  "SharedAccessSignature sr=#{uri}&sig=#{signature}&se=#{expiry}&skn=#{sas_name}"
-end
+class ServiceBus
+  def initialize(logger)
+    @logger = logger
+  end
 
-def peek_msg(url, auth_token)
-  uri = URI.parse(url)
-  http = Net::HTTP.new(uri.host, uri.port)
-  http.use_ssl = true if uri.scheme == 'https'
+  def get_auth_token(sb_name, queue_name, sas_name, sas_value)
+    uri = URI.encode_www_form_component("https://#{sb_name}.servicebus.windows.net/#{queue_name}")
+    sas = sas_value.encode('utf-8')
+    expiry = (Time.now + 2_000).to_i.to_s
+    string_to_sign = "#{uri}\n#{expiry}".encode('utf-8')
+    signed_hmac_sha256 = OpenSSL::HMAC.digest(OpenSSL::Digest.new('sha256'), sas, string_to_sign)
+    signature = URI.encode_www_form_component(Base64.strict_encode64(signed_hmac_sha256))
 
-  request = Net::HTTP::Post.new(uri.path)
+    "SharedAccessSignature sr=#{uri}&sig=#{signature}&se=#{expiry}&skn=#{sas_name}"
+  end
 
-  request['Authorization'] = auth_token
+  def peek_msg(url, auth_token)
+    uri = URI.parse(url)
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl = true if uri.scheme == 'https'
 
-  http.request(request)
-end
+    request = Net::HTTP::Post.new(uri.path)
 
-def delete_msg(url, auth_token)
-  uri = URI.parse(url)
-  http = Net::HTTP.new(uri.host, uri.port)
-  http.use_ssl = true if uri.scheme == 'https'
+    request['Authorization'] = auth_token
 
-  request = Net::HTTP::Delete.new(uri.path)
+    http.request(request)
+  end
 
-  request['Authorization'] = auth_token
+  def delete_msg(url, auth_token)
+    uri = URI.parse(url)
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl = true if uri.scheme == 'https'
 
-  http.request(request)
-end
+    request = Net::HTTP::Delete.new(uri.path)
 
-def unlock_msg(url, auth_token)
-  uri = URI.parse(url)
-  http = Net::HTTP.new(uri.host, uri.port)
-  http.use_ssl = true if uri.scheme == 'https'
+    request['Authorization'] = auth_token
 
-  request = Net::HTTP::Put.new(uri.path)
+    http.request(request)
+  end
 
-  request['Authorization'] = auth_token
+  def unlock_msg(url, auth_token)
+    uri = URI.parse(url)
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl = true if uri.scheme == 'https'
 
-  http.request(request)
+    request = Net::HTTP::Put.new(uri.path)
+
+    request['Authorization'] = auth_token
+
+    http.request(request)
+  end
+
+  def process_peek_msg(peek_url, token)
+    resp = peek_msg(peek_url, token)
+    if resp.code == '204'
+      @logger.info 'No message in the queue'
+    else
+      headers = resp.each_header.to_h
+      @logger.debug "Headers: #{headers}"
+      if headers.key?(:brokerproperties)
+        prop = JSON.parse(headers['brokerproperties'])
+
+        lock_token = prop['LockToken']
+        seq_number = prop['SequenceNumber']
+        msg_id = prop['MessageId']
+
+        @logger.debug "Lock Token: #{lock_token}"
+        @logger.debug "Message ID: #{msg_id}"
+        @logger.debug "Sequence Number: #{seq_number}"
+
+        [lock_token, msg_id, seq_number]
+      else
+        @logger.error 'brokerproperties header missing'
+        [nil, nil, nil]
+      end
+    end
+  end
 end
 
 sb_name = ENV.fetch('SB_NAMESPACE')
@@ -60,33 +95,24 @@ queue_name = ENV.fetch('QUEUE_NAME', 'test_queue')
 sas_name = ENV.fetch('SAS_NAME', 'RootManageSharedAccessKey')
 sas_value = ENV.fetch('SAS_VALUE')
 
-logger = Logger.new($stdout)
-logger.level = ENV.fetch('LOGLEVEL', 'DEBUG')
-
-token = get_auth_token(sb_name, queue_name, sas_name, sas_value)
+sb = ServiceBus.new(logger)
+token = sb.get_auth_token(sb_name, queue_name, sas_name, sas_value)
 logger.debug "Auth Token: #{token}"
 peek_url = "https://#{sb_name}.servicebus.windows.net/#{queue_name}/messages/head"
 
-resp = peek_msg(peek_url, token)
-headers = resp.each_header.to_h
-logger.debug "Headers: #{headers}"
-prop = JSON.parse(headers['brokerproperties'])
+lock_token, msg_id, = sb.process_peek_msg(peek_url, token)
 
-lock_token = prop['LockToken']
-seq_number = prop['SequenceNumber']
-msg_id = prop['MessageId']
+if msg_id.nil? || lock_token.nil?
+  logger.info 'Message ID or Lock Token missing, unable to unlock or delete the message'
+else
+  delete_or_unlock_url = "https://#{sb_name}.servicebus.windows.net/#{queue_name}/messages/#{msg_id}/#{lock_token}"
+  logger.debug "Delete OR Unlock URL:  #{delete_or_unlock_url}"
 
-logger.debug "Lock Token: #{lock_token}"
-logger.debug "Message ID: #{msg_id}"
-logger.debug "Sequence Number: #{seq_number}"
+  resp = sb.unlock_msg(delete_or_unlock_url, token)
+  logger.debug "Response Code: #{resp.code}"
+  logger.debug "Response Body: #{resp.body}"
 
-delete_or_unlock_url = "https://#{sb_name}.servicebus.windows.net/#{queue_name}/messages/#{msg_id}/#{lock_token}"
-logger.debug "Delete OR Unlock URL:  #{delete_or_unlock_url}"
-
-resp = unlock_msg(delete_or_unlock_url, token)
-logger.debug "Response Code: #{resp.code}"
-logger.debug "Response Body: #{resp.body}"
-
-# resp = delete_msg(delete_or_unlock_url, token)
-logger.debug "Response Code: #{resp.code}"
-logger.debug "Response Body: #{resp.body}"
+  # resp = sb.delete_msg(delete_or_unlock_url, token)
+  # logger.debug "Response Code: #{resp.code}"
+  # logger.debug "Response Body: #{resp.body}"
+end
