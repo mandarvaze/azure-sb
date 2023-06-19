@@ -14,6 +14,7 @@ sas_name = ENV.fetch('SAS_NAME', 'RootManageSharedAccessKey')
 sas_value = ENV.fetch('SAS_VALUE')
 max_delivery_count = ENV.fetch('MAX_DELIEVERY_COUNT', 10)
 process_dead_letter = ENV.fetch('PROCESS_DLQ', 'false').downcase == 'true'
+delete_message = ENV.fetch('DELETE_MESSAGE', 'false').downcase == 'true'
 
 sb = ServiceBus.new(logger)
 
@@ -36,7 +37,14 @@ else
   delete_or_unlock_url = "https://#{sb_name}.servicebus.windows.net/#{queue_name}/messages/#{msg_id}/#{lock_token}"
   logger.debug "Delete OR Unlock URL:  #{delete_or_unlock_url}"
 
-  resp = sb.unlock_msg(delete_or_unlock_url, token)
+  if delete_message
+    logger.info 'Deleting the message from the queue'
+    resp = sb.delete_msg(delete_or_unlock_url, token)
+  else
+    logger.info 'Unlocking the message'
+    resp = sb.unlock_msg(delete_or_unlock_url, token)
+  end
+
   logger.debug "Response Code: #{resp.code}"
   logger.debug "Response Body: #{resp.body}"
 end

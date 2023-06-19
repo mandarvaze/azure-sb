@@ -74,7 +74,7 @@ class ServiceBus
         msg_id = prop['MessageId']
         delivery_count = prop['DeliveryCount']
 
-        @logger.debug "Message: #{resp.body}"
+        @logger.info "Message: #{resp.body}"
         @logger.debug "Lock Token: #{lock_token}"
         @logger.debug "Message ID: #{msg_id}"
         @logger.debug "Sequence Number: #{seq_number}"
