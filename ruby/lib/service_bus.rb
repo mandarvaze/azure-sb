@@ -6,10 +6,6 @@ require 'openssl'
 require 'base64'
 require 'net/http'
 require 'json'
-require 'logger'
-
-logger = Logger.new($stdout)
-logger.level = ENV.fetch('LOGLEVEL', 'DEBUG')
 
 class ServiceBus
   def initialize(logger)
@@ -70,49 +66,25 @@ class ServiceBus
     else
       headers = resp.each_header.to_h
       @logger.debug "Headers: #{headers}"
-      if headers.key?(:brokerproperties)
+      if headers.key?('brokerproperties')
         prop = JSON.parse(headers['brokerproperties'])
 
         lock_token = prop['LockToken']
         seq_number = prop['SequenceNumber']
         msg_id = prop['MessageId']
+        delivery_count = prop['DeliveryCount']
 
+        @logger.debug "Message: #{resp.body}"
         @logger.debug "Lock Token: #{lock_token}"
         @logger.debug "Message ID: #{msg_id}"
         @logger.debug "Sequence Number: #{seq_number}"
+        @logger.debug "Delivery Count: #{delivery_count}"
 
-        [lock_token, msg_id, seq_number]
+        [lock_token, msg_id, delivery_count, resp.body]
       else
         @logger.error 'brokerproperties header missing'
-        [nil, nil, nil]
+        [nil, nil, nil, resp.body]
       end
     end
   end
-end
-
-sb_name = ENV.fetch('SB_NAMESPACE')
-queue_name = ENV.fetch('QUEUE_NAME', 'test_queue')
-sas_name = ENV.fetch('SAS_NAME', 'RootManageSharedAccessKey')
-sas_value = ENV.fetch('SAS_VALUE')
-
-sb = ServiceBus.new(logger)
-token = sb.get_auth_token(sb_name, queue_name, sas_name, sas_value)
-logger.debug "Auth Token: #{token}"
-peek_url = "https://#{sb_name}.servicebus.windows.net/#{queue_name}/messages/head"
-
-lock_token, msg_id, = sb.process_peek_msg(peek_url, token)
-
-if msg_id.nil? || lock_token.nil?
-  logger.info 'Message ID or Lock Token missing, unable to unlock or delete the message'
-else
-  delete_or_unlock_url = "https://#{sb_name}.servicebus.windows.net/#{queue_name}/messages/#{msg_id}/#{lock_token}"
-  logger.debug "Delete OR Unlock URL:  #{delete_or_unlock_url}"
-
-  resp = sb.unlock_msg(delete_or_unlock_url, token)
-  logger.debug "Response Code: #{resp.code}"
-  logger.debug "Response Body: #{resp.body}"
-
-  # resp = sb.delete_msg(delete_or_unlock_url, token)
-  # logger.debug "Response Code: #{resp.code}"
-  # logger.debug "Response Body: #{resp.body}"
 end
