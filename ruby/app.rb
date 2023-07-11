@@ -15,6 +15,7 @@ sas_value = ENV.fetch('SAS_VALUE')
 max_delivery_count = ENV.fetch('MAX_DELIEVERY_COUNT', 10)
 process_dead_letter = ENV.fetch('PROCESS_DLQ', 'false').downcase == 'true'
 delete_message = ENV.fetch('DELETE_MESSAGE', 'false').downcase == 'true'
+requeue_message = ENV.fetch('REQUEUE_MESSAGE', 'false').downcase == 'true'
 
 sb = ServiceBus.new(logger)
 
@@ -23,10 +24,14 @@ token = sb.get_auth_token(sb_name, queue_name, sas_name, sas_value)
 logger.debug "Auth Token: #{token}"
 
 peek_url = "https://#{sb_name}.servicebus.windows.net/#{queue_name}/messages/head"
+send_url = "https://#{sb_name}.servicebus.windows.net/#{queue_name}/messages"
 
-lock_token, msg_id, delivery_count, msg = sb.process_peek_msg(peek_url, token)
+lock_token, msg_id, sb_delivery_count, msg = sb.process_peek_msg(peek_url, token)
+return if lock_token.nil? || msg_id.nil?
 
 message = JSON.parse(msg)
+# If message does not have DeliveryCount, use one supplied by ServiceBus.
+delivery_count = message['DeliveryCount'].nil? ? sb_delivery_count : message['DeliveryCount'].to_i + 1
 if !delivery_count.nil? && delivery_count >= max_delivery_count
   logger.fatal "Message with WebhookId will be going to DLQ : #{message['WebhookId']}"
 end
@@ -40,6 +45,17 @@ else
   if delete_message
     logger.info 'Deleting the message from the queue'
     resp = sb.delete_msg(delete_or_unlock_url, token)
+  elsif requeue_message
+    logger.info 'Sending the message back to the queue'
+    # Set/update the delivery count.
+    message['DeliveryCount'] = delivery_count
+    # Add delay of at least 1 minute (in case delivery count is zero)
+    time_to_enqueue = Time.now + 60 * delivery_count + 60
+    resp = sb.send_scheduled_msg(send_url, token, time_to_enqueue, message)
+    if resp.code == '201' # Successfully requeued, now delete original message
+      logger.info 'Deleting the original message from the queue'
+      resp = sb.delete_msg(delete_or_unlock_url, token)
+    end
   else
     logger.info 'Unlocking the message'
     resp = sb.unlock_msg(delete_or_unlock_url, token)

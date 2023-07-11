@@ -35,6 +35,26 @@ class ServiceBus
     http.request(request)
   end
 
+  def send_scheduled_msg(url, auth_token, scheduled_time_utc, data)
+    uri = URI.parse(url)
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl = true if uri.scheme == 'https'
+
+    request = Net::HTTP::Post.new(uri.path)
+
+    # Refer https://learn.microsoft.com/en-us/rest/api/servicebus/message-headers-and-properties
+    # ScheduledEnqueueTimeUtc needs to be in RFC2616 format
+    # hence httpdate
+    broker_properties = {
+      'ScheduledEnqueueTimeUtc': scheduled_time_utc.httpdate
+    }
+    request['Authorization'] = auth_token
+    request['BrokerProperties'] = broker_properties.to_json
+    request.body = data.to_json
+    request.content_type = 'application/json'
+    http.request(request)
+  end
+
   def delete_msg(url, auth_token)
     uri = URI.parse(url)
     http = Net::HTTP.new(uri.host, uri.port)
@@ -63,6 +83,7 @@ class ServiceBus
     resp = peek_msg(peek_url, token)
     if resp.code == '204'
       @logger.info 'No message in the queue'
+      [nil, nil, nil, resp.body]
     else
       headers = resp.each_header.to_h
       @logger.debug "Headers: #{headers}"
